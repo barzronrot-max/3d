@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Right-Hand Focused Particle Visualizer</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        canvas { display: block; }
+        #ui {
+            position: absolute; top: 20px; left: 20px; color: white;
+            background: rgba(0,0,0,0.6); padding: 15px; border-radius: 8px;
+            pointer-events: none; border: 1px solid #333;
+        }
+        .status { color: #0f0; font-weight: bold; }
+        .hint { font-size: 0.8em; color: #aaa; margin-top: 5px; }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <div id="visual-name">System: Solar System</div>
+    <div id="tracking-status">Hand: <span class="status" id="hand-label">Searching...</span></div>
+    <div class="hint">Strict Right-Hand Control Enabled</div>
+</div>
+
+<canvas id="visualizer"></canvas>
+
+<script>
+/** * CORE SETTINGS & STATE
+ * Continuous Lerp & Decoupled Physics logic preserved.
+ */
+const canvas = document.getElementById('visualizer');
+const ctx = canvas.getContext('2d');
+let width, height;
+
+let particles = [];
+let currentSystem = 'solar';
+const lerpFactor = 0.08;
+
+// Target variables for smoothing
+let targetX = 0, targetY = 0, targetScale = 1, targetRotation = 0;
+// Current smoothed values
+let curX = 0, curY = 0, curScale = 1, curRotation = 0;
+
+/**
+ * PARTICLE DESIGNS (Logic Unchanged)
+ */
+function initSystem(type) {
+    currentSystem = type;
+    particles = [];
+    const count = type === 'solar' ? 800 : 1500;
+    
+    for (let i = 0; i < count; i++) {
+        particles.push({
+            x: Math.random() * 2 - 1,
+            y: Math.random() * 2 - 1,
+            z: Math.random() * 2 - 1,
+            size: Math.random() * 2 + 1,
+            baseColor: type === 'solar' ? `hsl(${Math.random() * 40 + 20}, 80%, 60%)` : `hsl(${Math.random() * 60 + 200}, 70%, 50%)`,
+            angle: Math.random() * Math.PI * 2,
+            dist: Math.random() * 300 + 50
+        });
+    }
+}
+
+/**
+ * MEDIAPIPE - RIGHT HAND EXCLUSIVE LOGIC
+ */
+const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+});
+
+hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.7
+});
+
+hands.onResults((results) => {
+    let rightHandFound = false;
+
+    if (results.multiHandLandmarks && results.multiHandedness) {
+        for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+            const classification = results.multiHandedness[i];
+            const landmarks = results.multiHandLandmarks[i];
+
+            // MediaPipe mirrors: Physical Right Hand is usually labeled 'Left' in raw mirrored data 
+            // unless SelfieMode is toggled. We check 'Right' based on standard projection.
+            if (classification.label === 'Right') {
+                rightHandFound = true;
+                
+                // Update Targets based on index finger tip (landmark 8)
+                const tip = landmarks[8];
+                targetX = (tip.x - 0.5) * 2 * (width / 2);
+                targetY = (tip.y - 0.5) * 2 * (height / 2);
+                
+                // Pinch logic for scale (Index and Thumb)
+                const thumb = landmarks[4];
+                const dist = Math.sqrt(Math.pow(tip.x - thumb.x, 2) + Math.pow(tip.y - thumb.y, 2));
+                targetScale = 0.5 + dist * 5;
+
+                // Rotation based on wrist to middle finger
+                targetRotation = Math.atan2(landmarks[9].y - landmarks[0].y, landmarks[9].x - landmarks[0].x) + Math.PI/2;
+                
+                document.getElementById('hand-label').innerText = "Active (Right)";
+                document.getElementById('hand-label').style.color = "#0f0";
+                break; // Only process the first Right hand found
+            }
+        }
+    }
+
+    if (!rightHandFound) {
+        // Fallback: Rest State
+        targetX = 0;
+        targetY = 0;
+        targetScale = 1.0;
+        targetRotation = 0;
+        document.getElementById('hand-label').innerText = "Rest (Right Hand Required)";
+        document.getElementById('hand-label').style.color = "#f33";
+    }
+});
+
+const camera = new Camera(document.createElement('video'), {
+    onFrame: async () => {
+        await hands.send({image: camera.video});
+    },
+    width: 640,
+    height: 480
+});
+camera.start();
+
+/**
+ * ANIMATION LOOP
+ */
+function resize() {
+    width = canvas.width = window.innerWidth;
+    height = canvas.height = window.innerHeight;
+}
+
+function animate() {
+    // Continuous Lerp Smoothing
+    curX += (targetX - curX) * lerpFactor;
+    curY += (targetY - curY) * lerpFactor;
+    curScale += (targetScale - curScale) * lerpFactor;
+    curRotation += (targetRotation - curRotation) * lerpFactor;
+
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.save();
+    ctx.translate(width / 2 + curX, height / 2 + curY);
+    ctx.rotate(curRotation);
+    ctx.scale(curScale, curScale);
+
+    particles.forEach(p => {
+        // Movement Logic (Physics decoupled)
+        p.angle += 0.01;
+        const x = Math.cos(p.angle) * p.dist;
+        const y = Math.sin(p.angle) * p.dist;
+
+        ctx.beginPath();
+        ctx.arc(x, y, p.size, 0, Math.PI * 2);
+        ctx.fillStyle = p.baseColor;
+        ctx.fill();
+    });
+
+    ctx.restore();
+    requestAnimationFrame(animate);
+}
+
+window.addEventListener('resize', resize);
+resize();
+initSystem('solar');
+animate();
+
+</script>
+</body>
+</html>
