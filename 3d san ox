@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Sandbox Builder | Leon</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #0f172a; font-family: 'Inter', sans-serif; }
+        canvas { display: block; }
+        #video-container { position: fixed; bottom: 20px; right: 20px; width: 240px; height: 180px; border: 2px solid #334155; border-radius: 12px; overflow: hidden; transform: scaleX(-1); }
+        #guide-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        .toast { transition: opacity 0.3s ease-in-out; pointer-events: none; }
+    </style>
+</head>
+<body>
+
+    <div class="fixed inset-0 pointer-events-none z-10 flex flex-col justify-between p-6">
+        <div class="flex justify-between items-start pointer-events-auto">
+            <div class="bg-slate-900/80 backdrop-blur-md p-4 rounded-xl border border-slate-700 shadow-2xl">
+                <h1 class="text-white font-bold text-xl mb-1">LEON SANDBOX</h1>
+                <div id="status" class="flex items-center gap-2 text-sm text-amber-400">
+                    <span class="relative flex h-3 w-3">
+                        <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                        <span class="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
+                    </span>
+                    SEARCHING FOR HANDS
+                </div>
+            </div>
+            
+            <div id="toast" class="toast opacity-0 bg-emerald-500 text-white px-4 py-2 rounded-lg shadow-lg font-medium">
+                ✓ Progress Saved
+            </div>
+        </div>
+
+        <div class="flex flex-col gap-3 w-48 pointer-events-auto">
+            <button onclick="spawnObject('box')" class="bg-slate-800 hover:bg-indigo-600 text-white py-2 rounded-lg border border-slate-600 transition-all">Add Box</button>
+            <button onclick="spawnObject('cylinder')" class="bg-slate-800 hover:bg-indigo-600 text-white py-2 rounded-lg border border-slate-600 transition-all">Add Cylinder</button>
+            <button onclick="spawnObject('beam')" class="bg-slate-800 hover:bg-indigo-600 text-white py-2 rounded-lg border border-slate-600 transition-all">Add Beam</button>
+            <hr class="border-slate-700 my-1">
+            <button onclick="clearAll()" class="bg-red-900/50 hover:bg-red-600 text-white py-2 rounded-lg border border-red-700 transition-all">Clear All</button>
+        </div>
+    </div>
+
+    <div id="loading-screen" class="fixed inset-0 z-50 bg-slate-950 flex flex-col items-center justify-center text-white">
+        <div class="w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+        <p class="tracking-widest font-mono text-lg">HELLO LEON, PREPARING SANDBOX...</p>
+    </div>
+
+    <div id="video-container">
+        <video id="input-video" class="hidden"></video>
+        <canvas id="guide-canvas"></canvas>
+    </div>
+
+    <script>
+        /** * CONSTANTS & GLOBALS
+         */
+        const GRAVITY_STRENGTH = 0.08;
+        const PINCH_THRESHOLD = 3.0;
+        const LERP_FACTOR = 0.2;
+        let scene, camera, renderer, clock;
+        let objects = [];
+        let handJoints = [];
+        let handLines = [];
+        let grabbedObject = null;
+        let lastGrabPosition = new THREE.Vector3();
+
+        // Downward Raycasters for Physics (Center + 4 Corners)
+        const raycaster = new THREE.Raycaster();
+        const downVector = new THREE.Vector3(0, -1, 0);
+
+        /**
+         * INITIALIZATION
+         */
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x0f172a);
+            scene.fog = new THREE.Fog(0x0f172a, 10, 50);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 10, 15);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.body.appendChild(renderer.domElement);
+
+            // Lighting
+            const ambient = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambient);
+
+            const directional = new THREE.DirectionalLight(0xffffff, 1);
+            directional.position.set(5, 15, 5);
+            directional.castShadow = true;
+            directional.shadow.mapSize.width = 1024;
+            directional.shadow.mapSize.height = 1024;
+            scene.add(directional);
+
+            // Floor
+            const floorGeo = new THREE.PlaneGeometry(100, 100);
+            const floorMat = new THREE.MeshStandardMaterial({ color: 0x1e293b });
+            const floor = new THREE.Mesh(floorGeo, floorMat);
+            floor.rotation.x = -Math.PI / 2;
+            floor.receiveShadow = true;
+            floor.name = "Floor";
+            scene.add(floor);
+
+            const grid = new THREE.GridHelper(100, 40, 0x334155, 0x1e293b);
+            scene.add(grid);
+
+            // Hand Visuals Initialization
+            initHandVisuals();
+
+            clock = new THREE.Clock();
+            window.addEventListener('resize', onWindowResize);
+            
+            // Load Saved Data
+            loadFromStorage();
+            
+            document.getElementById('loading-screen').style.display = 'none';
+            animate();
+        }
+
+        function initHandVisuals() {
+            const jointGeo = new THREE.SphereGeometry(0.1, 8, 8);
+            const jointMat = new THREE.MeshBasicMaterial({ color: 0x6366f1 });
+            
+            for (let i = 0; i < 21; i++) {
+                const joint = new THREE.Mesh(jointGeo, jointMat);
+                joint.visible = false;
+                scene.add(joint);
+                handJoints.push(joint);
+            }
+
+            // Pinch Indicators (Landmarks 4 and 8)
+            handJoints[4].material = new THREE.MeshBasicMaterial({ color: 0xf43f5e });
+            handJoints[8].material = new THREE.MeshBasicMaterial({ color: 0xf43f5e });
+        }
+
+        /**
+         * PHYSICS & INTERACTION
+         */
+        function spawnObject(type, pos = { x: 0, y: 10, z: 0 }, save = true) {
+            let geometry, color;
+            switch(type) {
+                case 'box': 
+                    geometry = new THREE.BoxGeometry(2, 2, 2); 
+                    color = 0x818cf8; break;
+                case 'cylinder': 
+                    geometry = new THREE.CylinderGeometry(1, 1, 2, 16); 
+                    color = 0x34d399; break;
+                case 'beam': 
+                    geometry = new THREE.BoxGeometry(4, 0.5, 1); 
+                    color = 0xfbbf24; break;
+            }
+
+            const material = new THREE.MeshStandardMaterial({ color: color });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.position.set(pos.x, pos.y, pos.z);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            mesh.userData = { type: type, velocityY: 0, isGrabbed: false, parentObj: null };
+            
+            scene.add(mesh);
+            objects.push(mesh);
+            if(save) saveToStorage();
+            return mesh;
+        }
+
+        function updatePhysics() {
+            objects.forEach(obj => {
+                if (obj.userData.isGrabbed) return;
+
+                // Simple Raycast floor/stack detection
+                // We check the bottom of the object
+                const origin = obj.position.clone();
+                const halfHeight = obj.geometry.parameters.height ? obj.geometry.parameters.height / 2 : 1;
+                origin.y -= halfHeight - 0.1;
+
+                raycaster.set(origin, downVector);
+                const intersects = raycaster.intersectObjects([...objects, scene.children.find(c => c.name === "Floor")]);
+                
+                let grounded = false;
+                let groundObj = null;
+
+                for (let intersect of intersects) {
+                    if (intersect.object !== obj && intersect.distance < 0.2) {
+                        grounded = true;
+                        groundObj = intersect.object;
+                        break;
+                    }
+                }
+
+                if (!grounded) {
+                    obj.userData.velocityY -= GRAVITY_STRENGTH;
+                    obj.position.y += obj.userData.velocityY;
+                    obj.userData.parentObj = null;
+                } else {
+                    obj.userData.velocityY = 0;
+                    // Stacking logic: Follow the object below
+                    if (groundObj && groundObj.name !== "Floor") {
+                        obj.userData.parentObj = groundObj;
+                        obj.position.x = THREE.MathUtils.lerp(obj.position.x, groundObj.position.x, 0.1);
+                        obj.position.z = THREE.MathUtils.lerp(obj.position.z, groundObj.position.z, 0.1);
+                    }
+                }
+
+                // Bounds check
+                if (obj.position.y < -10) {
+                    obj.position.set(0, 10, 0);
+                    obj.userData.velocityY = 0;
+                }
+            });
+        }
+
+        /**
+         * HAND TRACKING LOGIC
+         */
+        const videoElement = document.getElementById('input-video');
+        const canvasElement = document.getElementById('guide-canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        hands.onResults(onResults);
+
+        function onResults(results) {
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            const statusEl = document.getElementById('status');
+            if (results.multiHandLandmarks.length > 0) {
+                statusEl.innerHTML = `<span class="h-3 w-3 rounded-full bg-emerald-500"></span> HANDS ACTIVE`;
+                statusEl.className = "flex items-center gap-2 text-sm text-emerald-400";
+            } else {
+                statusEl.innerHTML = `<span class="relative flex h-3 w-3"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span><span class="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span></span> SEARCHING FOR HANDS`;
+                statusEl.className = "flex items-center gap-2 text-sm text-amber-400";
+            }
+
+            // Draw hand visuals in 3D
+            handJoints.forEach(j => j.visible = false);
+
+            if (results.multiHandLandmarks) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    // Update 3D Joints
+                    landmarks.forEach((lm, i) => {
+                        const joint = handJoints[i];
+                        joint.visible = true;
+                        // Map 0-1 range to 3D scene (Scale and Offset)
+                        joint.position.x = (lm.x - 0.5) * -25;
+                        joint.position.y = (lm.y - 0.5) * -15 + 5;
+                        joint.position.z = lm.z * -10;
+                    });
+
+                    // Pinch Logic
+                    const thumbTip = handJoints[4].position;
+                    const indexTip = handJoints[8].position;
+                    const dist = thumbTip.distanceTo(indexTip);
+
+                    if (dist < PINCH_THRESHOLD) {
+                        if (!grabbedObject) {
+                            // Find nearest object
+                            objects.forEach(obj => {
+                                if (obj.position.distanceTo(indexTip) < 3) {
+                                    grabbedObject = obj;
+                                    grabbedObject.userData.isGrabbed = true;
+                                }
+                            });
+                        }
+                    } else {
+                        if (grabbedObject) {
+                            grabbedObject.userData.isGrabbed = false;
+                            grabbedObject = null;
+                            saveToStorage();
+                        }
+                    }
+
+                    if (grabbedObject) {
+                        grabbedObject.position.lerp(indexTip, LERP_FACTOR);
+                        grabbedObject.userData.velocityY = 0;
+                    }
+
+                    // Draw to 2D UI Mini-map
+                    drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#6366f1', lineWidth: 2});
+                    drawLandmarks(canvasCtx, landmarks, {color: '#f43f5e', lineWidth: 1, radius: 2});
+                }
+            }
+            canvasCtx.restore();
+        }
+
+        /**
+         * STORAGE
+         */
+        function saveToStorage() {
+            const data = objects.map(obj => ({
+                type: obj.userData.type,
+                x: obj.position.x,
+                y: obj.position.y,
+                z: obj.position.z
+            }));
+            localStorage.setItem('leon_sandbox_data', JSON.stringify(data));
+            
+            const toast = document.getElementById('toast');
+            toast.style.opacity = '1';
+            setTimeout(() => toast.style.opacity = '0', 2000);
+        }
+
+        function loadFromStorage() {
+            const raw = localStorage.getItem('leon_sandbox_data');
+            if (raw) {
+                const data = JSON.parse(raw);
+                data.forEach(item => spawnObject(item.type, { x: item.x, y: item.y, z: item.z }, false));
+            }
+        }
+
+        function clearAll() {
+            objects.forEach(obj => scene.remove(obj));
+            objects = [];
+            saveToStorage();
+        }
+
+        /**
+         * ENGINE LOOP
+         */
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            updatePhysics();
+            renderer.render(scene, camera);
+        }
+
+        const cameraHandle = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        cameraHandle.start();
+
+        window.onload = init;
+    </script>
+</body>
+</html>
